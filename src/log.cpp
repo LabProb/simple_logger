@@ -7,15 +7,17 @@
 #include <mutex>
 #include <thread>
 
-// М'ютекс для атомарного виводу одного рядка в консоль
-static std::mutex &get_cout_mutex() {
-  static std::mutex m;
-  return m;
+namespace {
+
+// Intentionally never destroyed: it remains usable by late static destructors.
+// Logging after the standard streams themselves are destroyed is still unsupported.
+std::mutex &output_mutex() {
+  static auto *mutex = new std::mutex;
+  return *mutex;
 }
 
-// Перетворення LogLevel у рядок
-static const char *level_to_string(LogLevel lvl) {
-  switch (lvl) {
+const char *level_to_string(LogLevel level) noexcept {
+  switch (level) {
   case INFO:
     return "INFO";
   case DEBUG:
@@ -24,88 +26,75 @@ static const char *level_to_string(LogLevel lvl) {
     return "WARNING";
   case ERROR:
     return "ERROR";
-  default:
-    return "UNKNOWN";
   }
+  return "UNKNOWN";
 }
 
-static std::string current_datetime_string() {
-  using namespace std::chrono;
-  auto now = system_clock::now();
-
-  // seconds part for std::put_time
-  auto now_time_t = system_clock::to_time_t(now);
-  std::tm tm;
+std::string current_datetime_string() {
+  const auto now = std::chrono::system_clock::now();
+  const auto time = std::chrono::system_clock::to_time_t(now);
+  std::tm local_time{};
 #if defined(_MSC_VER)
-  localtime_s(&tm, &now_time_t);
+  localtime_s(&local_time, &time);
 #else
-  localtime_r(&now_time_t, &tm);
+  localtime_r(&time, &local_time);
 #endif
 
-  // milliseconds part
-  auto ms = duration_cast<milliseconds>(now.time_since_epoch()) % 1000;
-
-  std::ostringstream oss;
-  oss << std::put_time(&tm, "%Y-%m-%d %H:%M:%S") << '.' << std::setw(3)
-      << std::setfill('0') << ms.count();
-  return oss.str();
+  const auto milliseconds =
+      std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()) % 1000;
+  std::ostringstream result;
+  result << std::put_time(&local_time, "%Y-%m-%d %H:%M:%S") << '.'
+         << std::setw(3) << std::setfill('0') << milliseconds.count();
+  return result.str();
 }
 
-// ---------------- Logger ----------------
+} // namespace
 
-Logger::Logger(const std::string &prefix) : prefix_(prefix) {}
+Logger::Logger(std::string prefix) : prefix_(std::move(prefix)), output_(&std::cout) {}
 
-LogEntry Logger::operator()(LogLevel level) const {
-  return LogEntry(*this, level);
-}
+Logger::Logger(std::string prefix, std::ostream &output)
+    : prefix_(std::move(prefix)), output_(&output) {}
 
-LogEntry Logger::operator<<(const std::string &msg) const {
-  LogEntry e(*this, INFO);
-  e << msg;
-  return e;
-}
+LogEntry Logger::log(LogLevel level) const { return LogEntry(prefix_, level, *output_); }
 
-Logger getLogger() { return Logger(); }
+LogEntry Logger::operator()(LogLevel level) const { return log(level); }
 
-Logger getLogger(const std::string &prefix) { return Logger(prefix); }
+Logger getLogger() { return Logger{}; }
 
-// ---------------- LogEntry ----------------
+Logger getLogger(std::string prefix) { return Logger{std::move(prefix)}; }
 
-LogEntry::LogEntry(const Logger &logger, LogLevel level)
-    : logger_(logger), level_(level), ss_(), moved_from_(false) {}
+LogEntry::LogEntry(std::string prefix, LogLevel level, std::ostream &output)
+    : prefix_(std::move(prefix)), level_(level), output_(&output) {}
 
 LogEntry::LogEntry(LogEntry &&other) noexcept
-    : logger_(other.logger_), level_(other.level_), ss_(), moved_from_(false) {
-  ss_ << other.ss_.str();
-  other.moved_from_ = true;
+    : prefix_(std::move(other.prefix_)), level_(other.level_), output_(other.output_),
+      message_(std::move(other.message_)), active_(other.active_) {
+  other.active_ = false;
 }
 
-LogEntry::~LogEntry() {
-  if (moved_from_)
-    return; // якщо переміщено — нічого не робимо
-
-  // Формуємо фінальний рядок
-  std::ostringstream out;
-  out << current_datetime_string() << "; " << level_to_string(level_) << "; ";
-
-  // Префікс (якщо є) і id потоку
-  if (!logger_.prefix().empty()) {
-    out << logger_.prefix();
+LogEntry::~LogEntry() noexcept {
+  if (!active_) {
+    return;
   }
-  // thread id як числове представлення (через hash)
-  std::hash<std::thread::id> hasher;
-  auto tid_hash = hasher(std::this_thread::get_id());
-  out << "(" << tid_hash << "): ";
 
-  // Додаємо повідомлення
-  out << ss_.str();
+  // A destructor must not propagate an iostream/allocation failure during stack unwinding.
+  try {
+    std::ostringstream line;
+    line << current_datetime_string() << "; " << level_to_string(level_) << "; ";
+    if (!prefix_.empty()) {
+      line << prefix_;
+    }
+    line << '(' << std::hash<std::thread::id>{}(std::this_thread::get_id()) << "): "
+         << message_.str();
 
-  // Гарантуємо, що весь рядок виводиться атомарно
-  std::lock_guard<std::mutex> lock(get_cout_mutex());
-  std::cout << out.str() << std::endl;
+    std::lock_guard<std::mutex> lock(output_mutex());
+    *output_ << line.str() << '\n';
+  } catch (...) {
+    // Logging must not terminate the application. There is no safe reporting channel here.
+  }
 }
 
 LogEntry &LogEntry::operator<<(Manip manip) {
-  manip(ss_);
+  manip(message_);
   return *this;
 }
