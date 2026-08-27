@@ -93,7 +93,5 @@ int main() {
     lg3(ERROR) << "Smoke: error from constructed logger";
   }
 
-  std::cout << "Press Enter to exit..." << std::endl;
-  std::cin.get();
   return 0;
 }
